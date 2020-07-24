@@ -212,6 +212,18 @@ class ProcessGroupNCCL : public ProcessGroup {
       std::vector<std::vector<at::Tensor>>& inputTensors,
       const ScatterOptions& opts = ScatterOptions()) override;
 
+  std::shared_ptr<ProcessGroup::Work> alltoall_base(
+      at::Tensor& outputTensor,
+      at::Tensor& inputTensor,
+      std::vector<int64_t>& outputSplitSizes,
+      std::vector<int64_t>& inputSplitSizes,
+      const AllToAllOptions& opts = AllToAllOptions()) override;
+
+  std::shared_ptr<ProcessGroup::Work> alltoall(
+      std::vector<at::Tensor>& outputTensors,
+      std::vector<at::Tensor>& inputTensors,
+      const AllToAllOptions& opts = AllToAllOptions()) override;
+
   std::shared_ptr<ProcessGroup::Work> send(
       std::vector<at::Tensor>& tensors,
       int dstRank,
@@ -264,6 +276,14 @@ class ProcessGroupNCCL : public ProcessGroup {
       Fn fn,
       PreProcess pre,
       PostProcess post);
+  std::shared_ptr<ProcessGroup::Work> batchedp2p(
+      std::vector<void*>& send_ptrs,
+      std::vector<int>& send_lengths,
+      std::vector<void*>& recv_ptrs,
+      std::vector<int>& recv_lengths,
+      ncclDataType_t datatype,
+      std::vector<at::Tensor>& inputs,
+      std::vector<at::Tensor>& outputs);
 
   // Checks for NCCL errors on each of the communicators and returns an
   // appropriate exception_ptr (nullptr if no errors).

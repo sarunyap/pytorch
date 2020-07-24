@@ -16,6 +16,7 @@ from sys import platform
 from itertools import groupby
 from functools import reduce
 import operator
+from collections import namedtuple
 
 import torch
 from torch._six import string_classes
@@ -28,7 +29,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from torch.testing._internal.common_distributed import MultiProcessTestCase, \
     requires_gloo, requires_nccl, requires_nccl_version, \
-    skip_if_not_multigpu, skip_if_lt_x_gpu, skip_for_known_issues, get_timeout, skip_if_rocm, \
+    skip_if_not_multigpu, skip_if_lt_x_gpu, get_timeout, skip_if_rocm, \
     simple_sparse_reduce_tests
 
 from torch.testing._internal.common_utils import TestCase, load_tests, run_tests, \
@@ -47,6 +48,17 @@ if platform == 'darwin':
     LOOPBACK = 'lo0'
 else:
     LOOPBACK = 'lo'
+
+TIMEOUT_DEFAULT = 60
+TIMEOUT_OVERRIDE = {}
+
+TestSkip = namedtuple('TestSkip', 'exit_code, message')
+
+TEST_SKIPS = {
+    "multi-gpu": TestSkip(75, "Need at least 2 CUDA devices"),
+    "nccl": TestSkip(76, "c10d not compiled with NCCL support"),
+    "known_issues": TestSkip(77, "Test skipped due to known issues")
+}
 
 
 def gpus_for_rank(world_size):
@@ -219,6 +231,10 @@ class FileStoreTest(TestCase, StoreTestBase):
     def setUp(self):
         super(FileStoreTest, self).setUp()
         self.file = tempfile.NamedTemporaryFile(delete=False)
+        fullname = self.id().lower()
+        is_cuda_test = 'gpu' in fullname or 'cuda' in fullname or 'cuda' in torch.tensor([]).device.type
+        if not is_cuda_test:
+            raise unittest.SkipTest("Test is probably not a CUDA test. Skipping to save time.")
 
     def _create_store(self):
         store = c10d.FileStore(self.file.name, 1)
@@ -233,6 +249,10 @@ class PrefixFileStoreTest(TestCase, StoreTestBase):
         self.filestore = c10d.FileStore(self.file.name, 1)
         self.prefix = "test_prefix"
         self.filestore.set_timeout(timedelta(seconds=300))
+        fullname = self.id().lower()
+        is_cuda_test = 'gpu' in fullname or 'cuda' in fullname or 'cuda' in torch.tensor([]).device.type
+        if not is_cuda_test:
+            raise unittest.SkipTest("Test is probably not a CUDA test. Skipping to save time.")
 
     def _create_store(self):
         return c10d.PrefixStore(self.prefix, self.filestore)
@@ -279,6 +299,10 @@ class PrefixTCPStoreTest(TestCase, StoreTestBase):
         self.tcpstore = create_tcp_store('localhost')
         self.prefix = "test_prefix"
         self.tcpstore.set_timeout(timedelta(seconds=300))
+        fullname = self.id().lower()
+        is_cuda_test = 'gpu' in fullname or 'cuda' in fullname or 'cuda' in torch.tensor([]).device.type
+        if not is_cuda_test:
+            raise unittest.SkipTest("Test is probably not a CUDA test. Skipping to save time.")
 
     def _create_store(self):
         return c10d.PrefixStore(self.prefix, self.tcpstore)
@@ -681,7 +705,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             # Run with 1 input tensor
             x = fn(torch.tensor([self.rank]))
             broadcast([x], i, 0)
-            self.assertEqual(torch.tensor([i]), x)
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(torch.tensor([i]), x)
 
             # Run with 2 input tensors
             num = 2
@@ -692,8 +717,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                 ]
 
                 broadcast(xs, i, j)
-                self.assertEqual(torch.tensor([i * num + j]), xs[0])
-                self.assertEqual(torch.tensor([i * num + j]), xs[1])
+                # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+                self.assertEqualIgnoreType(torch.tensor([i * num + j]), xs[0])
+                # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+                self.assertEqualIgnoreType(torch.tensor([i * num + j]), xs[1])
 
         # Test overloaded convenience function
         x = torch.tensor([self.rank + 1.0])
@@ -767,7 +794,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             tensor = fn(input)
             work = pg.allreduce([tensor], opts)
             work.wait()
-            self.assertEqual(output, tensor)
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(output, tensor)
 
         # Multi input tests
         tests = simple_multi_input_reduce_tests(self.rank, self.world_size)
@@ -778,7 +806,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             work = pg.allreduce(tensors, opts)
             work.wait()
             for tensor in tensors:
-                self.assertEqual(output, tensor)
+                # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+                self.assertEqualIgnoreType(output, tensor)
 
         # Test overloaded convenience function (defaults to using sum)
         x = fn(torch.tensor([self.rank + 1.0]))
@@ -799,7 +828,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
         work_handles = [pg.allreduce(inputs[i]) for i in range(len(inputs))]
         for i, work_handle in enumerate(work_handles):
             work_handle.wait()
-            self.assertEqual(
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(
                 torch.tensor([
                     (i * self.world_size) +
                     (self.world_size * (self.world_size - 1) / 2)
@@ -864,7 +894,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             work = pg.allreduce_coalesced(tensors, opts)
             work.wait()
             for result_tensor, expected in zip(tensors, outputs):
-                self.assertEqual(result_tensor, expected)
+                # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+                self.assertEqualIgnoreType(result_tensor, expected)
 
     def test_allreduce_coalesced_basics(self):
         self._test_allreduce_coalesced_basics(lambda t: t.clone())
@@ -875,7 +906,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
         work_handles = [pg.allreduce_coalesced(input) for input in inputs]
         for i, work_handle in enumerate(work_handles):
             work_handle.wait()
-            self.assertEqual(
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(
                 2 * [torch.tensor([(i * self.world_size) + (self.world_size * (self.world_size - 1) / 2)])],
                 inputs[i],
                 message="Mismatch in interation {}".format(i)
@@ -1402,7 +1434,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                 work = pg.reduce([tmp], opts)
                 work.wait()
                 if root == self.rank:
-                    self.assertEqual(output, tmp)
+                    # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+                    self.assertEqualIgnoreType(output, tmp)
 
     def test_reduce_basics(self):
         self._test_reduce_basics(lambda t: t.clone())
@@ -1430,7 +1463,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             iter = i // self.world_size
             root = i % self.world_size
             if root == self.rank:
-                self.assertEqual(
+                # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+                self.assertEqualIgnoreType(
                     torch.tensor([
                         (iter * self.world_size) +
                         (self.world_size * (self.world_size - 1) / 2)
@@ -1624,7 +1658,8 @@ class ProcessGroupNCCLTest(TestCase):
         allreduce(tensors, c10d.ReduceOp.SUM)
 
         for i in range(self.num_gpus):
-            self.assertEqual(
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(
                 torch.tensor([float(self.num_gpus * (self.num_gpus + 1) / 2)]),
                 tensors[i])
 
@@ -1636,7 +1671,8 @@ class ProcessGroupNCCLTest(TestCase):
         allreduce(tensors, c10d.ReduceOp.PRODUCT)
 
         for i in range(self.num_gpus):
-            self.assertEqual(
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(
                 torch.tensor([float(math.factorial(self.num_gpus))]),
                 tensors[i])
 
@@ -1648,7 +1684,8 @@ class ProcessGroupNCCLTest(TestCase):
         allreduce(tensors, c10d.ReduceOp.MIN)
 
         for i in range(self.num_gpus):
-            self.assertEqual(torch.tensor([1.0]), tensors[i])
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(torch.tensor([1.0]), tensors[i])
 
         # Max
         tensors = []
@@ -1679,17 +1716,36 @@ class ProcessGroupNCCLTest(TestCase):
 
             reduce(tensors, self.rank, rt)
 
-            self.assertEqual(
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(
                 torch.tensor([float(self.num_gpus * (self.num_gpus + 1) / 2)]),
                 tensors[rt])
 
-    def test_allgather_ops(self):
+    def test_allgather_ops(self, no_copy=False, inplace=False):
         store = c10d.FileStore(self.file.name, self.world_size)
         pg = c10d.ProcessGroupNCCL(store, self.rank, self.world_size)
 
-        def allgather(output_ts, input_ts):
-            work = pg.allgather(output_ts, input_ts)
+        def allgather(output_ts, input_ts, no_copy):
+            opts = c10d.AllgatherOptions()
+            opts.noCopy = no_copy
+            work = pg.allgather(output_ts, input_ts, opts)
             work.wait()
+
+        def flatten(tl, outer_dim, inner_dim):
+            nels = tl[0][0].numel()
+            dtype = tl[0][0].dtype
+            new_tl = [
+                    torch.empty(dtype=dtype,size=[nels*inner_dim]).cuda(i)
+                    for i in range(outer_dim)
+            ]
+            new_tl = [
+                    [
+                        new_tl[i][j*nels:(j+1)*nels].reshape(tl[i][j].size()).copy_(tl[i][j])
+                        for j in range(inner_dim)
+                    ]
+                    for i in range(outer_dim)
+            ]
+            return new_tl
 
         tensors = []
         output_ts = [[] for _ in range(self.num_gpus)]
@@ -1701,27 +1757,68 @@ class ProcessGroupNCCLTest(TestCase):
         for i in range(self.num_gpus):
             tensors.append(torch.tensor([i]).cuda(i))
 
-        allgather(output_ts, tensors)
+        if no_copy:
+            output_ts = flatten(output_ts, self.num_gpus, self.world_size*self.num_gpus)
+            if inplace:
+                # copy input tensors to output and set_ input tensors to share storage with output
+                tensors = [t.set_(outp[0].copy_(t)) for t, outp in zip(tensors, output_ts)]
+
+        allgather(output_ts, tensors, no_copy)
 
         # Verification
         for device_ts in output_ts:
             for s_idx, t in enumerate(device_ts):
                 self.assertEqual(torch.tensor([s_idx]), t)
 
-    def test_reduce_scatter_ops(self):
+    def test_allgather_no_copy_ops(self):
+        self.test_allgather_ops(True,False)
+
+    def test_allgather_inplace_ops(self):
+        self.test_allgather_ops(True,True)
+
+    def test_reduce_scatter_ops(self, no_copy=False, inplace=False):
+        assert (not inplace or no_copy), "inplace requires no_copy"
+
         store = c10d.FileStore(self.file.name, self.world_size)
         pg = c10d.ProcessGroupNCCL(store, self.rank, self.world_size)
 
-        def reduce_scatter(outputs, input_lists, op):
+        def reduce_scatter(outputs, input_lists, op, no_copy):
             opts = c10d.ReduceScatterOptions()
             opts.reduceOp = op
+            opts.noCopy = no_copy
             work = pg.reduce_scatter(outputs, input_lists, opts)
             work.wait()
+
+        def maybe_flatten(tl, outp, outer_dim, inner_dim, flatten, inplace):
+            if flatten:
+                nels = tl[0][0].numel()
+                dtype = tl[0][0].dtype
+                new_tl = [
+                        torch.empty(dtype=dtype,size=[nels*inner_dim]).cuda(i)
+                        for i in range(outer_dim)
+                ]
+                new_tl = [
+                        [
+                            new_tl[i][j*nels:(j+1)*nels].reshape(tl[i][j].size()).copy_(tl[i][j])
+                            for j in range(inner_dim)
+                        ]
+                        for i in range(outer_dim)
+                ]
+                if inplace:
+                    new_outp = [
+                            new_tl[i][0]
+                            for i in range(outer_dim)
+                    ]
+                    return new_tl, new_outp
+                else:
+                    return new_tl, outp
+            else:
+                return tl, outp
 
         virtual_rank = self.rank * self.world_size
         virtual_world_size = self.num_gpus * self.world_size
 
-        output = [
+        orig_output = [
             torch.tensor([0]).cuda(i)
             for i in range(self.num_gpus)
         ]
@@ -1733,7 +1830,7 @@ class ProcessGroupNCCLTest(TestCase):
         #   3
 
         # Sum
-        tensor_lists = [
+        orig_tensor_lists = [
             [
                 torch.tensor([self.rank * self.num_gpus + i + j]).cuda(i)
                 for j in range(virtual_world_size)
@@ -1741,24 +1838,28 @@ class ProcessGroupNCCLTest(TestCase):
             for i in range(self.num_gpus)
         ]
 
-        reduce_scatter(output, tensor_lists, c10d.ReduceOp.SUM)
+        tensor_lists, output = maybe_flatten(orig_tensor_lists, orig_output, self.num_gpus, virtual_world_size, no_copy, inplace)
+        reduce_scatter(output, tensor_lists, c10d.ReduceOp.SUM, no_copy)
 
         for i in range(self.num_gpus):
             expected = torch.tensor([
                 float(self.num_gpus * (self.num_gpus - 1) / 2) +
                 (virtual_rank + i) * virtual_world_size
             ])
-            self.assertEqual(expected, output[i])
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(expected, output[i])
 
         # Min
-        reduce_scatter(output, tensor_lists, c10d.ReduceOp.MIN)
+        tensor_lists, output = maybe_flatten(orig_tensor_lists, orig_output, self.num_gpus, virtual_world_size, no_copy, inplace)
+        reduce_scatter(output, tensor_lists, c10d.ReduceOp.MIN, no_copy)
 
         for i in range(self.num_gpus):
             expected = torch.tensor([self.rank * self.world_size + i])
             self.assertEqual(expected, output[i])
 
         # Max
-        reduce_scatter(output, tensor_lists, c10d.ReduceOp.MAX)
+        tensor_lists, output = maybe_flatten(orig_tensor_lists, orig_output, self.num_gpus, virtual_world_size, no_copy, inplace)
+        reduce_scatter(output, tensor_lists, c10d.ReduceOp.MAX, no_copy)
 
         for i in range(self.num_gpus):
             expected = torch.tensor(
@@ -1767,7 +1868,7 @@ class ProcessGroupNCCLTest(TestCase):
             self.assertEqual(expected, output[i])
 
         # Product
-        tensor_lists = [
+        orig_tensor_lists = [
             [
                 torch.tensor([
                     (self.rank * self.num_gpus + i + j) % virtual_world_size + 1
@@ -1777,11 +1878,19 @@ class ProcessGroupNCCLTest(TestCase):
             for i in range(self.num_gpus)
         ]
 
-        reduce_scatter(output, tensor_lists, c10d.ReduceOp.PRODUCT)
+        tensor_lists, output = maybe_flatten(orig_tensor_lists, orig_output, self.num_gpus, virtual_world_size, no_copy, inplace)
+        reduce_scatter(output, tensor_lists, c10d.ReduceOp.PRODUCT, no_copy)
 
         for i in range(self.num_gpus):
             expected = torch.tensor([float(math.factorial(virtual_world_size))])
-            self.assertEqual(expected, output[i])
+            # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+            self.assertEqualIgnoreType(expected, output[i])
+
+    def test_reduce_scatter_no_copy_ops(self):
+        self.test_reduce_scatter_ops(True, False)
+
+    def test_reduce_scatter_inplace_ops(self):
+        self.test_reduce_scatter_ops(True, True)
 
     def test_barrier(self):
         store = c10d.FileStore(self.file.name, self.world_size)
@@ -1809,7 +1918,8 @@ class ProcessGroupNCCLTest(TestCase):
 
         for i in range(2, self.num_gpus + 1):
             for j in range(i):
-                self.assertEqual(
+                # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+                self.assertEqualIgnoreType(
                     torch.tensor([float(i * (i + 1) / 2)]),
                     tensors_list[i - 2][j])
 
@@ -2082,148 +2192,6 @@ class DistributedDataParallelTest(MultiProcessTestCase):
 
     @requires_nccl()
     @skip_if_not_multigpu
-    @skip_for_known_issues
-    def test_dist_broadcast_coalesced_nccl(self):
-        store = c10d.FileStore(self.file_name, self.world_size)
-        process_group = c10d.ProcessGroupNCCL(store, self.rank, self.world_size)
-
-        device = torch.device('cuda')
-
-        for fine_grained in [False, True]:
-            target = torch.arange(60, dtype=torch.float16, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float32, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float16, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float64, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float16, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float32, device=device).chunk(5)
-
-            if self.is_master:
-                # All processes should have these tensors in the end.
-                tensors = target
-            else:
-                # Non-master processes start with empty tensors and should be
-                # filled with the tensors from the master.
-                tensors = torch.zeros(60, dtype=torch.float16, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float32, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float16, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float64, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float16, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float32, device=device).chunk(5)
-
-            c10d._dist_broadcast_coalesced(
-                process_group,
-                tensors,
-                buffer_size=256,
-                fine_grained=fine_grained)
-
-            self.assertEqual(tensors, target)
-
-    @requires_gloo()
-    @skip_if_not_multigpu
-    def test_dist_broadcast_coalesced_gloo(self):
-        store = c10d.FileStore(self.file_name, self.world_size)
-        options = c10d.ProcessGroupGloo.Options()
-        options.devices = [c10d.ProcessGroupGloo.create_device(interface=LOOPBACK)]
-        process_group = c10d.ProcessGroupGloo(store, self.rank, self.world_size, options)
-
-        device = torch.device('cuda')
-
-        for fine_grained in [False, True]:
-            target = torch.arange(60, dtype=torch.float16, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float32, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float16, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float64, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float16, device=device).chunk(5)
-            target += torch.arange(60, dtype=torch.float32, device=device).chunk(5)
-
-            if self.is_master:
-                # All processes should have these tensors in the end.
-                tensors = target
-            else:
-                # Non-master processes start with empty tensors and should be
-                # filled with the tensors from the master.
-                tensors = torch.zeros(60, dtype=torch.float16, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float32, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float16, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float64, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float16, device=device).chunk(5)
-                tensors += torch.zeros(60, dtype=torch.float32, device=device).chunk(5)
-
-            c10d._dist_broadcast_coalesced(
-                process_group,
-                tensors,
-                buffer_size=128,
-                fine_grained=fine_grained)
-
-            self.assertEqual(tensors, target)
-
-    @requires_gloo()
-    @skip_if_not_multigpu
-    def test_sync_params_no_buffers(self, dtype=torch.double):
-        store = c10d.FileStore(self.file_name, self.world_size)
-        options = c10d.ProcessGroupGloo.Options()
-        options.devices = [c10d.ProcessGroupGloo.create_device(interface=LOOPBACK)]
-        process_group = c10d.ProcessGroupGloo(store, self.rank, self.world_size, options)
-
-        # Use all available devices on every process here (data is small, so should be fine).
-        devices = gpus_for_rank(self.world_size)[self.rank]
-        target = torch.arange(10, dtype=dtype, device='cuda:{}'.format(devices[0])).chunk(5)
-        parameter_data = [target]
-        parameter_data += [torch.zeros(10, dtype=dtype, device=torch.device('cuda', d)).chunk(5) for d in devices[1:]]
-        buffer_data = [[]] * len(parameter_data)
-
-        c10d._sync_params(
-            process_group,
-            parameter_data=parameter_data,
-            buffer_data=buffer_data,
-            devices=devices,
-            broadcast_bucket_size=10,
-            broadcast_buffers=False)
-
-        for device_data in parameter_data:
-            for i, parameter in enumerate(device_data):
-                self.assertEqual(parameter, target[i])
-
-    @requires_gloo()
-    @skip_if_not_multigpu
-    def test_sync_params_with_buffers(self, dtype=torch.double):
-        store = c10d.FileStore(self.file_name, self.world_size)
-        options = c10d.ProcessGroupGloo.Options()
-        options.devices = [c10d.ProcessGroupGloo.create_device(interface=LOOPBACK)]
-        process_group = c10d.ProcessGroupGloo(store, self.rank, self.world_size, options)
-
-        devices = gpus_for_rank(self.world_size)[self.rank]
-        target = torch.arange(10, dtype=dtype, device='cuda:{}'.format(devices[0])).chunk(5)
-        parameter_data = [target]
-        parameter_data += [torch.zeros(10, dtype=dtype, device=torch.device('cuda', d)).chunk(5) for d in devices[1:]]
-
-        # sync_params should do a dist_broadcast for buffers, so we only populate the master buffers and
-        # then check that other processes' tensors end up matching.
-
-        if self.is_master:
-            buffer_data = [target]
-            buffer_data += [torch.zeros(10, dtype=dtype, device=torch.device('cuda', d)).chunk(5) for d in devices[1:]]
-        else:
-            buffer_data = [torch.zeros(10, dtype=dtype, device=torch.device('cuda', d)).chunk(5) for d in devices]
-
-        c10d._sync_params(
-            process_group,
-            parameter_data=parameter_data,
-            buffer_data=buffer_data,
-            devices=devices,
-            broadcast_bucket_size=10,
-            broadcast_buffers=True)
-
-        for device_data in parameter_data:
-            for i, parameter in enumerate(device_data):
-                self.assertEqual(parameter, target[i])
-
-        for device_data in buffer_data:
-            for i, buffer in enumerate(device_data):
-                self.assertEqual(buffer, target[i])
-
-    @requires_nccl()
-    @skip_if_not_multigpu
     def test_fp16(self):
         store = c10d.FileStore(self.file_name, self.world_size)
         process_group = c10d.ProcessGroupNCCL(store, self.rank, self.world_size)
@@ -2252,53 +2220,6 @@ class DistributedDataParallelTest(MultiProcessTestCase):
         self.assertFalse(
             any(torch.isinf(p.grad).any() for p in ddp_model.parameters())
         )
-
-    @requires_nccl()
-    @skip_if_not_multigpu
-    def test_queue_reduction(self):
-        # Set up process group.
-        store = c10d.FileStore(self.file_name, self.world_size)
-        process_group = c10d.ProcessGroupNCCL(store, self.rank, self.world_size)
-
-        # Get this process' split of devices.
-        devices = gpus_for_rank(self.world_size)[self.rank]
-        grads_batch = [(torch.ones(10, device=torch.device('cuda', d)) *
-                       (self.rank + 1)).chunk(5)
-                       for d in devices]
-
-        work, local_grad_sum = c10d._queue_reduction(process_group,
-                                                     grads_batch,
-                                                     devices)
-        # The first return value should be the allreduce work item.
-        self.assertTrue(isinstance(work, c10d.Work))
-        # The second return value will be the finished allreduced gradients.
-        self.assertTrue(isinstance(local_grad_sum, torch.Tensor))
-
-        # Wait for the allreduce to finish.
-        work.wait()
-
-        # The expected result of the allreduce should be the average
-        self.assertEqual(local_grad_sum,
-                         torch.ones(10) * (self.world_size + 1) * len(devices) / 2.0)
-
-    @requires_nccl()
-    @skip_if_not_multigpu
-    def test_sync_reduction(self):
-        # Set up process group.
-        store = c10d.FileStore(self.file_name, self.world_size)
-        process_group = c10d.ProcessGroupNCCL(store, self.rank, self.world_size)
-
-        # Get this process' split of devices.
-        devices = gpus_for_rank(self.world_size)[self.rank]
-        grads_batch = [(torch.ones(10, device=torch.device('cuda', d)) *
-                       (self.rank + 1)).chunk(5)
-                       for d in devices]
-        work, local_grad_sum = c10d._queue_reduction(process_group,
-                                                     grads_batch,
-                                                     devices)
-        c10d._sync_reduction(work, grads_batch[0], local_grad_sum)
-        # The expected result of the allreduce should be the average
-        self.assertEqual(grads_batch[0], (torch.ones(10) * (self.world_size + 1) * len(devices) / 2.0).chunk(5))
 
     @requires_nccl()
     @skip_if_not_multigpu
@@ -2629,7 +2550,7 @@ class DistributedDataParallelTest(MultiProcessTestCase):
         # Run `forward` function with torch.no_grad()
         with torch.no_grad():
             output = model(input)
-            self.assertTrue(torch.is_tensor(output))
+            self.assertTrue(isinstance(output, torch.Tensor))
 
         # No parameter should have their gradient set.
         check_no_grads()
@@ -2734,7 +2655,8 @@ class DistributedDataParallelTest(MultiProcessTestCase):
                     input[self.rank : (self.rank + 1)],
                     target[self.rank : (self.rank + 1)])
                 for i, j in zip(model.parameters(), ddp_model.parameters()):
-                    self.assertEqual(i.grad, j.grad)
+                    # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
+                    self.assertEqualIgnoreType(i.grad, j.grad)
 
             # Shuffle the input so that DDP input is different
             torch.manual_seed(1337 + iteration)
@@ -2955,6 +2877,10 @@ class ReducerTest(TestCase):
     def setUp(self):
         self.store = c10d.FileStore("/dev/null", 1)
         self.process_group = c10d.ProcessGroupGloo(self.store, 0, 1)
+        fullname = self.id().lower()
+        is_cuda_test = 'gpu' in fullname or 'cuda' in fullname or 'cuda' in torch.tensor([]).device.type
+        if not is_cuda_test:
+            raise unittest.SkipTest("Test is probably not a CUDA test. Skipping to save time.")
 
     def test_single_dtype_single_bucket(self):
         model = ReducerModule()
@@ -2981,18 +2907,18 @@ class ReducerTest(TestCase):
     def test_multi_dtype_multi_bucket(self):
         model = self._create_mixed_precision_model()
         parameters = [list(model.parameters())]
-        group_by_type = groupby(
+        group_by_dtype = groupby(
             range(len(parameters[0])),
-            key=lambda i: parameters[0][i].type())
-        buckets = [list(indices) for _, indices in group_by_type]
+            key=lambda i: parameters[0][i].dtype)
+        buckets = [list(indices) for _, indices in group_by_dtype]
         dist.Reducer(parameters, buckets, self.process_group)
 
     def _create_reducer_for_models(self, models):
         parameters = [list(model.parameters()) for model in models]
-        group_by_type = groupby(
+        group_by_dtype = groupby(
             range(len(parameters[0])),
-            key=lambda i: parameters[0][i].type())
-        buckets = [list(indices) for _, indices in group_by_type]
+            key=lambda i: parameters[0][i].dtype)
+        buckets = [list(indices) for _, indices in group_by_dtype]
         return dist.Reducer(parameters, buckets, self.process_group)
 
     def test_forward_backward_single_replica(self):
@@ -3120,10 +3046,10 @@ class NcclErrorHandlingTest(MultiProcessTestCase):
         # Need to skip return code checking for these tests since the child
         # processes don't exit cleanly.
         self.skip_return_code_checks = [
-            self._get_wrapped_func(self.test_nccl_errors_blocking_abort),
-            self._get_wrapped_func(self.test_nccl_errors_blocking_sigkill),
-            self._get_wrapped_func(self.test_nccl_errors_blocking_sigterm),
-            self._get_wrapped_func(self.test_nccl_errors_blocking_nonzero_exit),
+            self.test_nccl_errors_blocking_abort.__wrapped__,
+            self.test_nccl_errors_blocking_sigkill.__wrapped__,
+            self.test_nccl_errors_blocking_sigterm.__wrapped__,
+            self.test_nccl_errors_blocking_nonzero_exit.__wrapped__,
         ]
         self._fork_processes()
 
@@ -3141,15 +3067,6 @@ class NcclErrorHandlingTest(MultiProcessTestCase):
     @property
     def world_size(self):
         return 3
-
-    def _get_wrapped_func(self, func):
-        # Get the original function which was wrapped in the decorator.
-        if hasattr(func, '__wrapped__'):
-            # py3 way.
-            return func.__wrapped__
-        else:
-            # py2 way.
-            return func.func_closure[0].cell_contents
 
     def _run_all_reduce(self, pg):
         pg.allreduce(torch.rand(10).cuda(self.rank))

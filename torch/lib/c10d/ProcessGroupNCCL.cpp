@@ -52,7 +52,6 @@ std::map<at::ScalarType, ncclDataType_t> ncclDataType = {
     {at::kInt, ncclInt32},
     {at::kLong, ncclInt64},
     {at::kHalf, ncclHalf},
-    {at::kBFloat16, ncclBfloat16},
 };
 
 // Helper function that gets the data type and issues error if not supported
@@ -125,6 +124,27 @@ std::string buildNcclUniqueIdStr(const ncclUniqueId& ncclID) {
 
 std::string getNcclAbortedCommStoreKey(const std::string ncclIdStr) {
   return std::string(kNCCLAbortedCommStoreKey) + ":" + ncclIdStr;
+}
+
+void checkSplitSizes(
+    const std::vector<int64_t>& split_sizes,
+    const at::Tensor& tensor,
+    int group_size) {
+  if (split_sizes.size() == 0) {
+    if (tensor.size(0) % group_size != 0) {
+      throw std::runtime_error(
+          "Tensor's dim 0 does not divide equally across group size");
+    }
+  } else {
+    if (split_sizes.size() != group_size) {
+      throw std::runtime_error(
+          "Number of tensor splits not equal to group size");
+    }
+    int sum = std::accumulate(split_sizes.begin(), split_sizes.end(), 0);
+    if (sum != tensor.size(0)) {
+      throw std::runtime_error("Split sizes doesn't match total dim 0 size");
+    }
+  }
 }
 
 } // namespace
@@ -539,12 +559,16 @@ std::vector<std::shared_ptr<NCCLComm>>& ProcessGroupNCCL::getNCCLComm(
 namespace {
 
 // Check that all `tensors' have the same type and shape and are distributed
-// across distinct GPUs.
-void check_gpu_tensors(const std::vector<at::Tensor>& tensors) {
+// across distinct GPUs. If alltoallv is true, distinct gpu and identical size
+// tests are waived
+void check_gpu_tensors_multi(
+    const std::vector<at::Tensor>& tensors,
+    bool alltoallv) {
   if (tensors.size() == 0) {
     throw std::runtime_error("Tensor list must be nonempty");
   }
-  if (tensors.size() > static_cast<size_t>(at::cuda::getNumGPUs())) {
+  if (!alltoallv &&
+      tensors.size() > static_cast<size_t>(at::cuda::getNumGPUs())) {
     throw std::runtime_error(
         "Tensor list mustn't be larger than the number of available GPUs");
   }
@@ -562,17 +586,23 @@ void check_gpu_tensors(const std::vector<at::Tensor>& tensors) {
     if (t.scalar_type() != first.scalar_type()) {
       throw std::runtime_error("Tensors must have identical type");
     }
-    if (t.sizes() != first.sizes()) {
+    if (!alltoallv && t.sizes() != first.sizes()) {
       throw std::runtime_error("Tensors must have identical size");
     }
     if (!t.is_contiguous()) {
       throw std::runtime_error("Tensors must be contiguous");
     }
-    const auto inserted = usedDevices.insert(t.get_device()).second;
-    if (!inserted) {
-      throw std::runtime_error("Tensors must be on distinct GPU devices");
+    if (!alltoallv) {
+      const auto inserted = usedDevices.insert(t.get_device()).second;
+      if (!inserted) {
+        throw std::runtime_error("Tensors must be on distinct GPU devices");
+      }
     }
   }
+}
+
+void check_gpu_tensors(const std::vector<at::Tensor>& tensors) {
+  check_gpu_tensors_multi(tensors, false);
 }
 
 // Flatten each list in `tensor_lists' for a gather or scatter operation, and
@@ -580,7 +610,9 @@ void check_gpu_tensors(const std::vector<at::Tensor>& tensors) {
 std::vector<at::Tensor> flatten_for_scatter_gather(
     std::vector<std::vector<at::Tensor>>& tensor_lists,
     std::vector<at::Tensor>& other,
-    size_t world_size) {
+    size_t world_size,
+    size_t rank,
+    bool no_copy) {
   if (tensor_lists.size() != other.size()) {
     throw std::runtime_error(
         "Tensor list operands to scatter/gather must have the same length");
@@ -611,8 +643,37 @@ std::vector<at::Tensor> flatten_for_scatter_gather(
             "All tensor operands to scatter/gather must have the same size");
       }
     }
-    // Flatten the tensors (from all ranks) into a single big tensor.
-    flattened[i] = newLikeFlat(tensor_lists, i);
+
+    if (no_copy) {
+      // no_copy operation requires all tensors in tensor_list are contiguous views
+      // into a single flattened tensor
+      for (auto j = size_t{}; j < tensor_lists[i].size(); ++j) {
+        auto t = tensor_lists[i][j];
+        if (!tensor_lists[i][j].storage().is_alias_of(tensor_lists[i][0].storage()) ||
+            tensor_lists[i][j].storage_offset() != (tensor_lists[i][0].storage_offset() +
+              j * tensor_lists[i][0].numel())) {
+          no_copy = false;
+          break;
+        }
+      }
+      // no_copy operation is allowed if other tensor does not share storage with tensors
+      // in tensor_list or other tensor is properly aligned according to rank.
+      if (other[i].storage().is_alias_of(tensor_lists[i][0].storage()) &&
+          other[i].storage_offset() != (tensor_lists[i][0].storage_offset() +
+            rank * tensor_lists[i][0].numel())) {
+        no_copy = false;
+      }
+    }
+
+    if (no_copy) {
+      flattened[i] = at::empty({0}, other[i].options()).set_(
+          tensor_lists[i][0].storage(),
+          tensor_lists[i][0].storage_offset(),
+          world_size * other[i].numel(), {});
+    } else {
+      // Flatten the tensors (from all ranks) into a single big tensor.
+      flattened[i] = newLikeFlat(tensor_lists, i);
+    }
   }
   return flattened;
 }
@@ -699,6 +760,79 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::collective(
       [](std::vector<at::cuda::CUDAStream>&) {});
 }
 
+// Should be redesigned to support multigpu alltoall.
+// Currently inputs and outputs vectors always have size 1
+// send_* and recv_* should be changed to std::vector<std::vector<T>>
+std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::batchedp2p(
+    std::vector<void*>& send_ptrs,
+    std::vector<int>& send_lengths,
+    std::vector<void*>& recv_ptrs,
+    std::vector<int>& recv_lengths,
+    ncclDataType_t datatype,
+    std::vector<at::Tensor>& inputs,
+    std::vector<at::Tensor>& outputs) {
+  const auto devices = getDeviceList(inputs);
+  const auto key = getKeyFromDevices(devices);
+  auto& ncclComms = getNCCLComm(key, devices);
+
+  // First let NCCL streams wait for input tensors allocation streams
+  syncStreams(devices, ncclEvents_[key], ncclStreams_[key]);
+
+  // Work itself will create the CUDA events on all GPUs of tensors
+  auto work = initWork(devices);
+
+  at::cuda::OptionalCUDAGuard gpuGuard;
+
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    gpuGuard.set_index(devices[i].index());
+    at::cuda::CUDAStream& ncclStream = ncclStreams_[key][i];
+    c10::cuda::CUDACachingAllocator::recordStream(
+        inputs[i].storage().data_ptr(), ncclStream);
+  }
+
+  {
+    AutoNcclGroup nccl_group_guard;
+    for (int i = 0; i < size_; ++i) {
+      for (size_t j = 0; j < inputs.size(); ++j)
+        gpuGuard.set_index(devices[j].index());
+      at::cuda::CUDAStream& ncclStream =
+          ncclStreams_[key][0]; // FIXME single stream anyway
+      C10D_NCCL_CHECK(ncclSend(
+          send_ptrs[i],
+          send_lengths[i],
+          datatype,
+          i,
+          ncclComms[0]->getNcclComm(),
+          ncclStream));
+      C10D_NCCL_CHECK(ncclRecv(
+          recv_ptrs[i],
+          recv_lengths[i],
+          datatype,
+          i,
+          ncclComms[0]->getNcclComm(),
+          ncclStream));
+    }
+  }
+
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    gpuGuard.set_index(devices[i].index());
+    at::cuda::CUDAStream& ncclStream = ncclStreams_[key][i];
+    c10::cuda::CUDACachingAllocator::recordStream(
+        outputs[i].storage().data_ptr(), ncclStream);
+  }
+
+  // Event should only be recorded after the ncclGroupEnd()
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    at::cuda::CUDAStream& ncclStream = ncclStreams_[key][i];
+    work->cudaEvents_[i].record(ncclStream);
+    work->ncclComms_[i] = ncclComms[i];
+    work->blockingWait_ = blockingWait_;
+    work->opTimeout_ = opTimeout_;
+  }
+
+  return work;
+}
+
 std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::allreduce(
     std::vector<at::Tensor>& tensors,
     const AllreduceOptions& opts) {
@@ -783,41 +917,49 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::allgather(
     const AllgatherOptions& opts) {
   check_gpu_tensors(inputTensors);
 
-  auto outputFlattened =
-      flatten_for_scatter_gather(outputTensors, inputTensors, size_);
+  auto outputFlattened = 
+      flatten_for_scatter_gather(outputTensors, inputTensors, size_, rank_, opts.noCopy);
+
   check_gpu_tensors(outputFlattened);
 
-  return collective(
-      inputTensors,
-      outputFlattened,
-      [&](at::Tensor& input,
-          at::Tensor& output,
-          ncclComm_t comm,
-          at::cuda::CUDAStream& stream) {
-        c10::cuda::CUDACachingAllocator::recordStream(
-            output.storage().data_ptr(), stream);
-        return ncclAllGather(
-            input.data_ptr(),
-            output.data_ptr(),
-            input.numel(),
-            getNcclDataType(input.scalar_type()),
-            comm,
-            stream.stream());
-      },
-      [&](std::vector<at::cuda::CUDAStream>& ncclStreams) {},
-      [&](std::vector<at::cuda::CUDAStream>& ncclStreams) {
-        // Copy the flattened output tensors to the outputs.
-        for (size_t i = 0; i < outputTensors.size(); ++i) {
-          at::cuda::CUDAStreamGuard guard(ncclStreams[i]);
-          for (size_t j = 0; j < outputTensors[0].size(); ++j) {
-            // See [Sync Streams].
-            c10::cuda::CUDACachingAllocator::recordStream(
-                outputTensors[i][j].storage().data_ptr(), ncclStreams[i]);
-
-            outputTensors[i][j].copy_(outputFlattened[i][j], true);
+  return collective(inputTensors, outputFlattened,
+    [&] (at::Tensor& input, at::Tensor& output,
+         ncclComm_t comm, at::cuda::CUDAStream& stream) {
+      c10::cuda::CUDACachingAllocator::recordStream(
+        output.storage().data_ptr(), stream
+      );
+      return ncclAllGather(
+        input.data_ptr(),
+        output.data_ptr(),
+        input.numel(),
+        getNcclDataType(input.scalar_type()),
+        comm,
+        stream.stream()
+      );
+    },
+    [&] (std::vector<at::cuda::CUDAStream>& ncclStreams) {},
+    [&] (std::vector<at::cuda::CUDAStream>& ncclStreams) {
+      // Copy the flattened output tensors to the outputs.
+      for (size_t i = 0; i < outputTensors.size(); ++i) {
+        at::cuda::CUDAStreamGuard guard(ncclStreams[i]);
+        for (size_t j = 0; j < outputTensors[0].size(); ++j) {
+          // Skip copy if it's in-place operation, where the input and
+          // output tensors share the same storage
+          if (outputFlattened[i][j].storage().is_alias_of(
+              outputTensors[i][j].storage()) &&
+              outputTensors[i][j].storage_offset() ==
+              (outputTensors[i][0].storage_offset() +
+              outputTensors[i][j].numel() * j)) {
+             break;
           }
-        }
-      });
+          // See [Sync Streams].
+          c10::cuda::CUDACachingAllocator::recordStream(
+            outputTensors[i][j].storage().data_ptr(), ncclStreams[i]);
+
+          outputTensors[i][j].copy_(outputFlattened[i][j], true);
+	}
+      }
+    });
 }
 
 std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::allgather_coalesced(
@@ -835,39 +977,46 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::reduce_scatter(
   check_gpu_tensors(outputTensors);
 
   auto inputFlattened =
-      flatten_for_scatter_gather(inputTensors, outputTensors, size_);
+      flatten_for_scatter_gather(inputTensors, outputTensors, size_, rank_, opts.noCopy);
   check_gpu_tensors(inputFlattened);
 
-  return collective(
-      inputFlattened,
-      outputTensors,
-      [&](at::Tensor& input,
-          at::Tensor& output,
-          ncclComm_t comm,
-          at::cuda::CUDAStream& stream) {
-        c10::cuda::CUDACachingAllocator::recordStream(
-            output.storage().data_ptr(), stream);
-        return ncclReduceScatter(
-            input.data_ptr(),
-            output.data_ptr(),
-            output.numel(),
-            getNcclDataType(input.scalar_type()),
-            ncclOp[opts.reduceOp],
-            comm,
-            stream.stream());
-      },
-      [&](std::vector<at::cuda::CUDAStream>& ncclStreams) {
-        // Copy the input tensors to the flattened inputs.
-        for (size_t i = 0; i < inputTensors.size(); ++i) {
-          at::cuda::CUDAStreamGuard guard(ncclStreams[i]);
-          for (size_t j = 0; j < inputTensors[0].size(); ++j) {
-            // See [Sync Streams].
-            c10::cuda::CUDACachingAllocator::recordStream(
-                inputTensors[i][j].storage().data_ptr(), ncclStreams[i]);
-
-            inputFlattened[i][j].copy_(inputTensors[i][j], true);
+  return collective(inputFlattened, outputTensors,
+    [&] (at::Tensor& input, at::Tensor& output,
+         ncclComm_t comm, at::cuda::CUDAStream& stream) {
+      c10::cuda::CUDACachingAllocator::recordStream(
+        output.storage().data_ptr(), stream
+      );
+      return ncclReduceScatter(
+        input.data_ptr(),
+        output.data_ptr(),
+        output.numel(),
+        getNcclDataType(input.scalar_type()),
+        ncclOp[opts.reduceOp],
+        comm,
+        stream.stream()
+      );
+    },
+    [&] (std::vector<at::cuda::CUDAStream>& ncclStreams) {
+      // Copy the input tensors to the flattened inputs.
+      for (size_t i = 0; i < inputTensors.size(); ++i) {
+        at::cuda::CUDAStreamGuard guard(ncclStreams[i]);
+        for (size_t j = 0; j < inputTensors[0].size(); ++j) {
+          // Skip copy if it's in-place operation, where the input and
+          // output tensors share the same storage
+          if (inputFlattened[i][j].storage().is_alias_of(
+              inputTensors[i][j].storage()) &&
+              inputTensors[i][j].storage_offset() ==
+              (inputTensors[i][0].storage_offset() +
+              inputTensors[i][j].numel() * j)) {
+             break;
           }
+          // See [Sync Streams].
+          c10::cuda::CUDACachingAllocator::recordStream(
+            inputTensors[i][j].storage().data_ptr(), ncclStreams[i]);
+
+          inputFlattened[i][j].copy_(inputTensors[i][j], true);
         }
+      }
       },
       [&](std::vector<at::cuda::CUDAStream>& ncclStreams) {});
 }
@@ -910,6 +1059,103 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::barrier(
   ncclWork->barrierTensors_ = std::move(barrierTensors);
 
   return work;
+}
+
+std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::alltoall_base(
+    at::Tensor& outputTensor,
+    at::Tensor& inputTensor,
+    std::vector<int64_t>& outputSplitSizes,
+    std::vector<int64_t>& inputSplitSizes,
+    const AllToAllOptions& opts) {
+  std::vector<at::Tensor> inputTensors = {inputTensor};
+  std::vector<at::Tensor> outputTensors = {outputTensor};
+  check_gpu_tensors(inputTensors);
+  check_gpu_tensors(outputTensors);
+
+  std::vector<int> send_lengths(size_);
+  std::vector<int> recv_lengths(size_);
+  std::vector<void*> send_ptrs(size_);
+  std::vector<void*> recv_ptrs(size_);
+  int typesize = at::elementSize(inputTensor.scalar_type());
+  if (outputSplitSizes.size() == 0 && inputSplitSizes.size() == 0) {
+    // We can use alltoall
+    if ((outputTensor.numel() != inputTensor.numel()) ||
+        (outputTensor.scalar_type() != inputTensor.scalar_type())) {
+      throw std::runtime_error("Tensors are not equal in size or data type");
+    }
+    if (outputTensor.size(0) % size_ != 0) {
+      throw std::runtime_error(
+          "Tensor's dim 0 does not divide equally across group size");
+    }
+
+    int len = inputTensor.numel() / size_;
+
+    for (int i = 0; i < size_; i++) {
+      send_lengths[i] = len;
+      recv_lengths[i] = len;
+      send_ptrs[i] = (char*)inputTensor.data_ptr() + typesize * len * i;
+      recv_ptrs[i] = (char*)outputTensor.data_ptr() + typesize * len * i;
+    }
+
+  } else {
+    // Need alltoallv
+    checkSplitSizes(inputSplitSizes, inputTensor, size_);
+    checkSplitSizes(outputSplitSizes, outputTensor, size_);
+
+    int row_size = inputTensor.numel() / inputTensor.size(0);
+    int64_t inputOffset = 0, outputOffset = 0;
+
+    for (int i = 0; i < size_; i++) {
+      send_ptrs[i] = (char*)inputTensor.data_ptr() + inputOffset * typesize;
+      recv_ptrs[i] = (char*)outputTensor.data_ptr() + outputOffset * typesize;
+      send_lengths[i] = row_size * inputSplitSizes[i];
+      recv_lengths[i] = row_size * outputSplitSizes[i];
+      inputOffset += send_lengths[i];
+      outputOffset += recv_lengths[i];
+    }
+  }
+
+  return batchedp2p(
+      send_ptrs,
+      send_lengths,
+      recv_ptrs,
+      recv_lengths,
+      getNcclDataType(inputTensor.scalar_type()),
+      inputTensors,
+      outputTensors);
+}
+
+std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::alltoall(
+    std::vector<at::Tensor>& outputTensors,
+    std::vector<at::Tensor>& inputTensors,
+    const AllToAllOptions& opts) {
+  if (inputTensors.size() != size_ || outputTensors.size() != size_) {
+    throw std::runtime_error(
+        "Number of input or output tensors are not equal to group size");
+  }
+  check_gpu_tensors_multi(inputTensors, true);
+  check_gpu_tensors_multi(outputTensors, true);
+  std::vector<int> send_lengths(size_);
+  std::vector<int> recv_lengths(size_);
+  std::vector<void*> send_ptrs(size_);
+  std::vector<void*> recv_ptrs(size_);
+
+  for (int i = 0; i < size_; i++) {
+    send_lengths[i] = inputTensors[i].numel();
+    recv_lengths[i] = outputTensors[i].numel();
+    send_ptrs[i] = inputTensors[i].data_ptr();
+    recv_ptrs[i] = outputTensors[i].data_ptr();
+  }
+  std::vector<at::Tensor> inputTensor = {inputTensors[0]};
+  std::vector<at::Tensor> outputTensor = {outputTensors[0]};
+  return batchedp2p(
+      send_ptrs,
+      send_lengths,
+      recv_ptrs,
+      recv_lengths,
+      getNcclDataType(inputTensors[0].scalar_type()),
+      inputTensor,
+      outputTensor);
 }
 
 std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::gather(
